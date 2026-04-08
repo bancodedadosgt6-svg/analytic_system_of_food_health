@@ -1,0 +1,16 @@
+streamlit>=1.44
+pandas>=2.2
+openpyxl>=3.1
+xlrd>=2.0.1
+plotly>=5.24
+folium>=0.18
+streamlit-folium>=0.24
+python-dotenv>=1.0
+google-api-python-client>=2.166
+google-auth>=2.38
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2
+pyarrow>=19.0
+geopandas>=1.0
+shapely>=2.0
+fiona>=1.10
