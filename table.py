@@ -3,7 +3,14 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from settings import get_categorical_columns, get_dataset_by_name, get_numeric_columns
+from calc import (
+    apply_filters,
+    get_filter_options,
+    get_schema,
+    has_health_food_schema,
+    prepare_health_food_dataframe,
+)
+from settings import get_dataset_by_name, get_dataset_last_update
 
 
 def render_table_tab(dataset_name: str, page_size: int = 25) -> None:
@@ -18,33 +25,75 @@ def render_table_tab(dataset_name: str, page_size: int = 25) -> None:
         st.warning("O dataset selecionado está vazio ou não pôde ser lido.")
         return
 
-    with st.expander("Filtros da tabela", expanded=True):
-        columns = df.columns.tolist()
-
-        visible_columns = st.multiselect(
-            "Colunas visíveis",
-            options=columns,
-            default=columns[: min(len(columns), 12)] if columns else [],
+    if not has_health_food_schema(df):
+        st.warning(
+            "O dataset selecionado não possui o schema esperado para o painel de saúde alimentar."
         )
+        return
+
+    df = prepare_health_food_dataframe(df)
+    schema = get_schema()
+
+    # =========================
+    # Data de atualização do arquivo
+    # =========================
+    last_update = get_dataset_last_update(dataset_name)
+    if last_update:
+        st.caption(f"Última atualização no Google Drive: {last_update}")
+    else:
+        st.caption("Última atualização no Google Drive: não disponível")
+
+    # =========================
+    # Filtros da tabela dinâmica
+    # =========================
+    options = get_filter_options(df)
+
+    with st.expander("Filtros da tabela dinâmica", expanded=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            selected_ubs = st.multiselect(
+                "Filtrar UBS",
+                options=options["ubs"],
+                default=[],
+            )
+
+            selected_categorias = st.multiselect(
+                "Filtrar Categoria profissional",
+                options=options["categorias"],
+                default=[],
+            )
+
+        with col2:
+            selected_tipos = st.multiselect(
+                "Filtrar Tipo",
+                options=options["tipos"],
+                default=[],
+            )
+
+            competencias = options["competencias"]
+            competencia_inicio = st.selectbox(
+                "Competência inicial",
+                options=[None] + competencias,
+                format_func=lambda x: "Selecione" if x is None else x,
+            )
+
+            competencia_fim = st.selectbox(
+                "Competência final",
+                options=[None] + competencias,
+                format_func=lambda x: "Selecione" if x is None else x,
+            )
 
         text_filter = st.text_input("Busca textual global")
 
-        categorical_cols = get_categorical_columns(df)
-        category_filter_col = st.selectbox(
-            "Filtrar categoria",
-            options=[None] + categorical_cols,
-            format_func=lambda x: "Selecione" if x is None else x,
-        )
-
-        category_values = []
-        if category_filter_col:
-            category_values = st.multiselect(
-                "Valores da categoria",
-                options=sorted(df[category_filter_col].dropna().astype(str).unique().tolist()),
-            )
-
-    # dataset base com filtros aplicados
-    base_filtered = df.copy()
+    base_filtered = apply_filters(
+        df=df,
+        ubs=selected_ubs if selected_ubs else None,
+        categorias=selected_categorias if selected_categorias else None,
+        tipos=selected_tipos if selected_tipos else None,
+        competencia_inicio=competencia_inicio,
+        competencia_fim=competencia_fim,
+    )
 
     if text_filter:
         mask = base_filtered.astype(str).apply(
@@ -52,45 +101,54 @@ def render_table_tab(dataset_name: str, page_size: int = 25) -> None:
         )
         base_filtered = base_filtered[mask.any(axis=1)]
 
-    if category_filter_col and category_values:
-        base_filtered = base_filtered[
-            base_filtered[category_filter_col].astype(str).isin(category_values)
-        ]
-
-    # dataset apenas para exibição
-    if visible_columns:
-        valid_visible_columns = [col for col in visible_columns if col in base_filtered.columns]
-        display_df = base_filtered[valid_visible_columns].copy()
-    else:
-        display_df = base_filtered.copy()
-
+    # =========================
+    # Métricas rápidas
+    # =========================
     c1, c2, c3 = st.columns(3)
     c1.metric("Registros", len(base_filtered))
-    c2.metric("Colunas", len(display_df.columns))
-    c3.metric("Campos numéricos", len(get_numeric_columns(base_filtered)))
+    c2.metric("UBSs", base_filtered[schema.ubs].nunique() if not base_filtered.empty else 0)
+    c3.metric(
+        "Categorias profissionais",
+        base_filtered[schema.categoria].nunique() if not base_filtered.empty else 0,
+    )
 
-    st.dataframe(display_df, use_container_width=True, height=500)
+    # =========================
+    # Tabela principal
+    # UBS | Categoria | Tipo | Competência | Registro
+    # =========================
+    display_columns = [
+        schema.ubs,
+        schema.categoria,
+        schema.tipo,
+        schema.competencia,
+        schema.valor,
+    ]
+
+    display_df = base_filtered[display_columns].copy()
+    display_df = display_df.rename(columns={schema.valor: "Registro"})
+
+    st.dataframe(display_df.head(page_size), use_container_width=True, height=500)
+
+    csv_main = display_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Baixar tabela principal em CSV",
+        data=csv_main,
+        file_name=f"tabela_principal_{dataset_name}.csv",
+        mime="text/csv",
+    )
 
     st.markdown("---")
     st.subheader("Agregação rápida")
 
-    numeric_cols = get_numeric_columns(base_filtered)
-    categorical_cols = get_categorical_columns(base_filtered)
-
-    if not numeric_cols or not categorical_cols:
-        st.info("É preciso ter ao menos uma coluna categórica e uma numérica para a agregação.")
-        return
-
     group_col = st.selectbox(
         "Agrupar por",
-        options=categorical_cols,
+        options=[schema.ubs, schema.categoria, schema.competencia],
+        format_func=lambda x: {
+            schema.ubs: "UBS",
+            schema.categoria: "Categoria profissional",
+            schema.competencia: "Competência",
+        }.get(x, x),
         key="table_group_col",
-    )
-
-    value_col = st.selectbox(
-        "Valor numérico",
-        options=numeric_cols,
-        key="table_value_col",
     )
 
     agg_func = st.selectbox(
@@ -99,20 +157,13 @@ def render_table_tab(dataset_name: str, page_size: int = 25) -> None:
         key="table_agg",
     )
 
-    if group_col not in base_filtered.columns:
-        st.error(f"A coluna de agrupamento '{group_col}' não existe mais no dataframe filtrado.")
-        return
-
-    if agg_func != "count" and value_col not in base_filtered.columns:
-        st.error(f"A coluna numérica '{value_col}' não existe mais no dataframe filtrado.")
-        return
-
     try:
         pivot = (
-            base_filtered.groupby(group_col, dropna=False)[value_col]
+            base_filtered.groupby(group_col, dropna=False)[schema.valor]
             .agg(agg_func)
             .reset_index()
-            .sort_values(by=value_col, ascending=False)
+            .rename(columns={schema.valor: "Registro"})
+            .sort_values(by="Registro", ascending=False)
         )
     except KeyError as e:
         st.error(f"Erro de coluna na agregação: {e}")
@@ -120,10 +171,10 @@ def render_table_tab(dataset_name: str, page_size: int = 25) -> None:
 
     st.dataframe(pivot.head(page_size), use_container_width=True)
 
-    csv = pivot.to_csv(index=False).encode("utf-8")
+    csv_pivot = pivot.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Baixar agregação em CSV",
-        data=csv,
+        data=csv_pivot,
         file_name=f"agregacao_{dataset_name}.csv",
         mime="text/csv",
     )

@@ -4,14 +4,25 @@ import streamlit as st
 
 from graphic import render_graphics_tab
 from map import render_map_tab
-from settings import APP_SUBTITLE, APP_TITLE, sync_google_drive_data
+from settings import (
+    APP_SUBTITLE,
+    APP_TITLE,
+    get_datasets_catalog,
+    load_css,
+    sync_google_drive_data,
+)
 from sidebar import render_sidebar
 from table import render_table_tab
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
+DEFAULT_PAGE_SIZE = 25
+DEFAULT_MAP_HEIGHT = 550
+
 
 def main() -> None:
+    load_css("style.css")
+
     st.title(APP_TITLE)
     st.caption(APP_SUBTITLE)
 
@@ -24,23 +35,30 @@ def main() -> None:
     c3.metric("Atualizados", sync_result["updated"])
     c4.metric("Ignorados", sync_result["skipped"])
 
-    sidebar_state = render_sidebar()
+    render_sidebar()
+
+    catalog = get_datasets_catalog()
+    if not catalog:
+        st.warning("Nenhum dataset foi encontrado na pasta local de dados.")
+        return
+
+    selected_dataset = catalog[0]["name"]
 
     tab1, tab2, tab3 = st.tabs(["Tabela", "Gráficos", "Mapas"])
 
     with tab1:
         render_table_tab(
-            dataset_name=sidebar_state["selected_dataset"],
-            page_size=sidebar_state["page_size"],
+            dataset_name=selected_dataset,
+            page_size=DEFAULT_PAGE_SIZE,
         )
 
     with tab2:
-        render_graphics_tab(dataset_name=sidebar_state["selected_dataset"])
+        render_graphics_tab(dataset_name=selected_dataset)
 
     with tab3:
         render_map_tab(
-            dataset_name=sidebar_state["selected_geo_dataset"],
-            map_height=sidebar_state["map_height"],
+            dataset_name=selected_dataset,
+            map_height=DEFAULT_MAP_HEIGHT,
         )
 
 

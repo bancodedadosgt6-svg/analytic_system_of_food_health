@@ -22,8 +22,8 @@ APP_TITLE = "Painel de Análise de Dados em Saúde Alimentar"
 APP_SUBTITLE = "MVP analítico com sincronização local de dados, tabela dinâmica, gráficos e mapas"
 
 SPONSORS = [
-    "Instituição Proponente",
-    "Parceiro Técnico",
+    "PET-Saúde Digital",
+    "GT6",
     "Rede de Pesquisa",
 ]
 
@@ -41,6 +41,18 @@ DEFAULT_LON_COLUMNS = ["longitude", "lon", "lng", "long", "x", "Longitude", "LON
 
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_css(css_file: str = "style.css") -> None:
+    """
+    Carrega um arquivo CSS local e injeta no app Streamlit.
+    """
+    css_path = BASE_DIR / css_file
+    if not css_path.exists():
+        return
+
+    css = css_path.read_text(encoding="utf-8")
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -89,9 +101,7 @@ def list_drive_files() -> List[dict]:
     if not GOOGLE_DRIVE_FOLDER_ID:
         raise ValueError("Defina GOOGLE_DRIVE_FOLDER_ID no ambiente.")
 
-    query = (
-        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
-    )
+    query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
     response = (
         service.files()
         .list(
@@ -201,6 +211,7 @@ def read_dataframe(path_str: str) -> pd.DataFrame:
     if suffix in {".geojson", ".json"}:
         try:
             import geopandas as gpd
+
             gdf = gpd.read_file(path)
             if gdf.empty:
                 return pd.DataFrame()
@@ -286,3 +297,28 @@ def get_datetime_columns(df: pd.DataFrame) -> List[str]:
             except Exception:
                 continue
     return candidates
+
+
+def get_dataset_last_update(dataset_name: str) -> str | None:
+    """
+    Retorna a data/hora de atualização do arquivo no Google Drive
+    com base no metadata local de sincronização.
+    """
+    metadata = load_metadata()
+    catalog = get_datasets_catalog()
+
+    item = next((d for d in catalog if d["name"] == dataset_name), None)
+    if not item:
+        return None
+
+    file_name = item["file_name"]
+    modified_time = metadata.get(file_name, {}).get("modifiedTime")
+
+    if not modified_time:
+        return None
+
+    try:
+        dt = pd.to_datetime(modified_time, utc=True).tz_convert("America/Sao_Paulo")
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(modified_time)
