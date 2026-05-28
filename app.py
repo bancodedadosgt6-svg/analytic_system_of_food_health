@@ -39,7 +39,7 @@ def main() -> None:
 
     catalog = get_datasets_catalog()
     if not catalog:
-        st.warning("Nenhum dataset foi encontrado na pasta local de dados.")
+        st.warning("Nenhum dado encontrado.")
         return
 
     selected_dataset = catalog[0]["name"]
