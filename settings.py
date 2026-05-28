@@ -4,12 +4,16 @@ import hashlib
 import io
 import json
 import os
+import socket
+import ssl
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from googleapiclient.errors import HttpError
 
 
 load_dotenv()
@@ -41,7 +45,6 @@ CONSOLIDATED_DATASET_NAME = "base_consolidada_saude_alimentar"
 CONSOLIDATED_DATASET_FILE_NAME = "base_consolidada_saude_alimentar.xlsx"
 CONSOLIDATED_DATASET_PATH = "__base_consolidada__"
 
-# Pastas e arquivos alimentados pelo sistema de submissão
 DRIVE_UBS_FOLDERS = {
     "Gama": "Gama",
     "Jardins Mangueiral": "Jardins-Mangueral",
@@ -237,8 +240,50 @@ def clear_dataset_caches() -> None:
 
 
 # =========================================================
-# GOOGLE DRIVE - OAUTH
+# GOOGLE DRIVE - RETRY / OAUTH
 # =========================================================
+
+def execute_drive_request(request, context: str = "requisição Google Drive", retries: int = 4):
+    """
+    Executa uma requisição da API do Google Drive com retry.
+
+    Protege o app contra falhas intermitentes no deploy:
+    - ssl.SSLError
+    - socket timeout
+    - connection reset
+    - HTTP 429 / 5xx
+    """
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return request.execute(num_retries=2)
+
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            last_error = e
+
+            if status in [429, 500, 502, 503, 504]:
+                time.sleep(min(2 * attempt, 10))
+                continue
+
+            raise
+
+        except (
+            ssl.SSLError,
+            socket.timeout,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as e:
+            last_error = e
+            time.sleep(min(2 * attempt, 10))
+            continue
+
+    raise RuntimeError(
+        f"Falha ao executar {context} após {retries} tentativas: {last_error}"
+    )
+
 
 @st.cache_resource(show_spinner=False)
 def get_google_drive_service():
@@ -313,6 +358,7 @@ def get_google_drive_service():
         "drive",
         "v3",
         credentials=creds,
+        cache_discovery=False,
     )
 
 
@@ -335,17 +381,18 @@ def buscar_pasta_por_nome(service, folder_name: str) -> str | None:
         "and trashed=false"
     )
 
-    response = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name)",
-            spaces="drive",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
+    request = service.files().list(
+        q=query,
+        fields="files(id, name)",
+        spaces="drive",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    )
+
+    response = execute_drive_request(
+        request,
+        context=f"buscar pasta '{folder_name}'",
     )
 
     files = response.get("files", [])
@@ -368,17 +415,18 @@ def buscar_arquivo_na_pasta(service, folder_id: str, file_name: str) -> dict | N
         "and trashed=false"
     )
 
-    response = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name, modifiedTime, mimeType, md5Checksum, size)",
-            spaces="drive",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
+    request = service.files().list(
+        q=query,
+        fields="files(id, name, modifiedTime, mimeType, md5Checksum, size)",
+        spaces="drive",
+        pageSize=10,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    )
+
+    response = execute_drive_request(
+        request,
+        context=f"buscar arquivo '{file_name}'",
     )
 
     files = response.get("files", [])
@@ -404,16 +452,17 @@ def list_drive_files_from_configured_folder() -> List[dict]:
 
     query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false"
 
-    response = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name, modifiedTime, mimeType, md5Checksum, size)",
-            pageSize=1000,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
+    request = service.files().list(
+        q=query,
+        fields="files(id, name, modifiedTime, mimeType, md5Checksum, size)",
+        pageSize=1000,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    )
+
+    response = execute_drive_request(
+        request,
+        context="listar arquivos da pasta configurada",
     )
 
     return response.get("files", [])
@@ -422,6 +471,7 @@ def list_drive_files_from_configured_folder() -> List[dict]:
 def list_drive_files_from_ubs_folders() -> List[dict]:
     """
     Lista os bancos XLSX das UBSs nas pastas esperadas.
+    Se uma pasta/arquivo falhar por instabilidade de rede, o app continua.
     """
     service = get_google_drive_service()
 
@@ -433,28 +483,36 @@ def list_drive_files_from_ubs_folders() -> List[dict]:
     for ubs_name, folder_name in DRIVE_UBS_FOLDERS.items():
         expected_file_name = DRIVE_UBS_FILES[ubs_name]
 
-        folder_id = buscar_pasta_por_nome(
-            service=service,
-            folder_name=folder_name,
-        )
+        try:
+            folder_id = buscar_pasta_por_nome(
+                service=service,
+                folder_name=folder_name,
+            )
 
-        if not folder_id:
+            if not folder_id:
+                continue
+
+            remote_file = buscar_arquivo_na_pasta(
+                service=service,
+                folder_id=folder_id,
+                file_name=expected_file_name,
+            )
+
+            if not remote_file:
+                continue
+
+            remote_file["ubs_name"] = ubs_name
+            remote_file["folder_name"] = folder_name
+            remote_file["folder_id"] = folder_id
+
+            files.append(remote_file)
+
+        except Exception as e:
+            st.warning(
+                f"Não foi possível consultar a UBS {ubs_name} no Google Drive agora. "
+                f"O painel continuará usando o cache local, se existir. Detalhe: {e}"
+            )
             continue
-
-        remote_file = buscar_arquivo_na_pasta(
-            service=service,
-            folder_id=folder_id,
-            file_name=expected_file_name,
-        )
-
-        if not remote_file:
-            continue
-
-        remote_file["ubs_name"] = ubs_name
-        remote_file["folder_name"] = folder_name
-        remote_file["folder_id"] = folder_id
-
-        files.append(remote_file)
 
     return files
 
@@ -474,6 +532,9 @@ def list_drive_files() -> List[dict]:
 
 
 def download_drive_file(file_id: str) -> bytes:
+    """
+    Baixa arquivo do Google Drive com retry.
+    """
     service = get_google_drive_service()
 
     if service is None:
@@ -481,20 +542,38 @@ def download_drive_file(file_id: str) -> bytes:
 
     from googleapiclient.http import MediaIoBaseDownload
 
-    request = service.files().get_media(
-        fileId=file_id,
-        supportsAllDrives=True,
-    )
+    last_error = None
 
-    buffer = io.BytesIO()
-    downloader = MediaIoBaseDownload(buffer, request)
+    for attempt in range(1, 5):
+        try:
+            request = service.files().get_media(
+                fileId=file_id,
+                supportsAllDrives=True,
+            )
 
-    done = False
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
 
-    while not done:
-        _, done = downloader.next_chunk()
+            done = False
 
-    return buffer.getvalue()
+            while not done:
+                _, done = downloader.next_chunk(num_retries=2)
+
+            return buffer.getvalue()
+
+        except (
+            ssl.SSLError,
+            socket.timeout,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            HttpError,
+        ) as e:
+            last_error = e
+            time.sleep(min(2 * attempt, 10))
+            continue
+
+    raise RuntimeError(f"Falha ao baixar arquivo do Google Drive: {last_error}")
 
 
 def sync_google_drive_data() -> Dict[str, int]:
@@ -505,14 +584,23 @@ def sync_google_drive_data() -> Dict[str, int]:
     - consulta metadados primeiro;
     - se assinatura remota não mudou, não baixa;
     - se mudou, baixa e substitui cache local;
-    - atualiza _sync_metadata.json.
+    - atualiza _sync_metadata.json;
+    - se o Drive falhar por instabilidade, o app continua usando cache local.
     """
     ensure_data_dir()
 
     if not GOOGLE_DRIVE_ENABLED:
         return {"checked": 0, "downloaded": 0, "updated": 0, "skipped": 0}
 
-    remote_files = list_drive_files()
+    try:
+        remote_files = list_drive_files()
+    except Exception as e:
+        st.warning(
+            f"Não foi possível consultar o Google Drive neste momento. "
+            f"O painel continuará usando os dados em cache local, se existirem. Detalhe: {e}"
+        )
+        return {"checked": 0, "downloaded": 0, "updated": 0, "skipped": 0}
+
     metadata = load_metadata()
 
     checked = downloaded = updated = skipped = 0
@@ -535,30 +623,38 @@ def sync_google_drive_data() -> Dict[str, int]:
             skipped += 1
             continue
 
-        content = download_drive_file(remote["id"])
-        content_hash = build_file_hash(content)
+        try:
+            content = download_drive_file(remote["id"])
+            content_hash = build_file_hash(content)
+            local_path.write_bytes(content)
 
-        local_path.write_bytes(content)
+            metadata[file_name] = {
+                "hash": content_hash,
+                "remote_signature": build_remote_signature(remote),
+                "file_id": remote["id"],
+                "folder_id": remote.get("folder_id"),
+                "folder_name": remote.get("folder_name"),
+                "ubs_name": remote.get("ubs_name"),
+                "modifiedTime": remote.get("modifiedTime"),
+                "mimeType": remote.get("mimeType"),
+                "md5Checksum": remote.get("md5Checksum"),
+                "size": remote.get("size"),
+            }
 
-        metadata[file_name] = {
-            "hash": content_hash,
-            "remote_signature": build_remote_signature(remote),
-            "file_id": remote["id"],
-            "folder_id": remote.get("folder_id"),
-            "folder_name": remote.get("folder_name"),
-            "ubs_name": remote.get("ubs_name"),
-            "modifiedTime": remote.get("modifiedTime"),
-            "mimeType": remote.get("mimeType"),
-            "md5Checksum": remote.get("md5Checksum"),
-            "size": remote.get("size"),
-        }
+            if is_update:
+                updated += 1
+            else:
+                downloaded += 1
 
-        if is_update:
-            updated += 1
-        else:
-            downloaded += 1
+            changed_any = True
 
-        changed_any = True
+        except Exception as e:
+            st.warning(
+                f"Não foi possível baixar/atualizar o arquivo {file_name}. "
+                f"O painel continuará usando o cache local, se existir. Detalhe: {e}"
+            )
+            skipped += 1
+            continue
 
     if changed_any:
         save_metadata(metadata)
@@ -664,7 +760,7 @@ def normalize_health_food_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Converte colunas do banco alimentado para o schema esperado pelo dashboard.
 
-    Entrada típica do sistema de submissão:
+    Entrada típica:
     - ubs
     - categoria
     - tipo
@@ -673,7 +769,7 @@ def normalize_health_food_columns(df: pd.DataFrame) -> pd.DataFrame:
     - identificados
     - nao_identificados
 
-    Saída esperada pelo dashboard:
+    Saída esperada:
     - UBS
     - Categoria
     - Tipo
@@ -774,8 +870,6 @@ def read_consolidated_health_food_dataframe() -> pd.DataFrame:
     - banco_jardins_mangueral.xlsx
     - banco_santa_maria.xlsx
     - ou qualquer outro banco_*.xlsx/csv/xls
-
-    Retorna uma única base para Tabela, Gráficos e Mapa.
     """
     ensure_data_dir()
 
