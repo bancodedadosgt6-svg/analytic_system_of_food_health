@@ -1,27 +1,34 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
-import os
-import socket
-import ssl
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from googleapiclient.errors import HttpError
+
+from supabase_client import (
+    SUPABASE_REGISTROS_TABLE,
+    fetch_registros_saude_alimentar,
+    get_supabase_environment_status,
+    test_supabase_connection,
+)
 
 
 load_dotenv()
 
 
+# =========================================================
+# CAMINHOS / IDENTIDADE DO APP
+# =========================================================
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-METADATA_FILE = DATA_DIR / "_sync_metadata.json"
+
+PARQUET_FILE = DATA_DIR / "base_saude_alimentar.parquet"
+METADATA_FILE = DATA_DIR / "_supabase_sync_metadata.json"
 
 APP_TITLE = "Painel de Análise de Dados em Saúde Alimentar"
 APP_SUBTITLE = "Projeto de Saúde Alimentar elaborado pela equipe do PET6 de Saúde Digital e Alimentar."
@@ -32,100 +39,39 @@ SPONSORS = [
     "Rede de Pesquisa",
 ]
 
-SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".parquet", ".geojson", ".json"}
+CONSOLIDATED_DATASET_NAME = "base_consolidada_saude_alimentar"
+CONSOLIDATED_DATASET_FILE_NAME = PARQUET_FILE.name
+CONSOLIDATED_DATASET_PATH = str(PARQUET_FILE)
 
 DEFAULT_LAT_COLUMNS = ["latitude", "lat", "y", "Latitude", "LATITUDE"]
 DEFAULT_LON_COLUMNS = ["longitude", "lon", "lng", "long", "x", "Longitude", "LONGITUDE"]
 
-GOOGLE_DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive",
+
+# =========================================================
+# COLUNAS PADRÃO
+# =========================================================
+
+EXPECTED_COLUMNS = [
+    "Registro ID",
+    "UBS ID",
+    "Submissão ID",
+    "Usuário ID",
+    "UBS",
+    "Categoria",
+    "Tipo",
+    "Competência",
+    "Valor",
+    "Identificados",
+    "Não identificados",
+    "Arquivo origem",
+    "Hash registro",
+    "Criado em",
 ]
 
-CONSOLIDATED_DATASET_NAME = "base_consolidada_saude_alimentar"
-CONSOLIDATED_DATASET_FILE_NAME = "base_consolidada_saude_alimentar.xlsx"
-CONSOLIDATED_DATASET_PATH = "__base_consolidada__"
-
-DRIVE_UBS_FOLDERS = {
-    "Gama": "Gama",
-    "Jardins Mangueiral": "Jardins-Mangueral",
-    "Santa Maria": "Santa-Maria",
-}
-
-DRIVE_UBS_FILES = {
-    "Gama": "banco_gama.xlsx",
-    "Jardins Mangueiral": "banco_jardins_mangueral.xlsx",
-    "Santa Maria": "banco_santa_maria.xlsx",
-}
-
 
 # =========================================================
-# CONFIGURAÇÕES / SECRETS
+# DIRETÓRIOS / ESTILO
 # =========================================================
-
-def get_secret_or_env(key: str, default=None):
-    """
-    Busca primeiro no Streamlit Secrets e depois no .env.
-    Funciona localmente e no deploy.
-    """
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-
-    return os.getenv(key, default)
-
-
-GOOGLE_DRIVE_ENABLED = str(
-    get_secret_or_env("GOOGLE_DRIVE_ENABLED", "false")
-).lower() == "true"
-
-# Opcional:
-# Se GOOGLE_DRIVE_FOLDER_ID existir, o sistema lê uma pasta única.
-# Se não existir, lê automaticamente as pastas das UBSs.
-GOOGLE_DRIVE_FOLDER_ID = str(
-    get_secret_or_env("GOOGLE_DRIVE_FOLDER_ID", "")
-).strip()
-
-GOOGLE_OAUTH_CREDENTIALS_FILE = get_secret_or_env(
-    "GOOGLE_OAUTH_CREDENTIALS_FILE",
-    "credentials.json",
-)
-
-GOOGLE_OAUTH_TOKEN_FILE = get_secret_or_env(
-    "GOOGLE_OAUTH_TOKEN_FILE",
-    "token.json",
-)
-
-
-def get_secret_json(key: str) -> dict | None:
-    """
-    Lê um JSON armazenado como string no secrets.toml.
-
-    Exemplo:
-    GOOGLE_OAUTH_TOKEN_JSON = \"\"\"
-    { ... }
-    \"\"\"
-    """
-    try:
-        value = st.secrets.get(key)
-    except Exception:
-        return None
-
-    if not value:
-        return None
-
-    if isinstance(value, dict):
-        return dict(value)
-
-    try:
-        return json.loads(str(value))
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"O segredo {key} não contém um JSON válido. "
-            f"Revise aspas, vírgulas e chaves no secrets.toml. Erro: {e}"
-        ) from e
-
 
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -149,7 +95,7 @@ def load_css(css_file: str = "style.css") -> None:
 # =========================================================
 
 @st.cache_data(show_spinner=False)
-def load_metadata() -> Dict[str, dict]:
+def load_metadata() -> Dict[str, Any]:
     ensure_data_dir()
 
     if not METADATA_FILE.exists():
@@ -161,7 +107,7 @@ def load_metadata() -> Dict[str, dict]:
         return {}
 
 
-def save_metadata(metadata: Dict[str, dict]) -> None:
+def save_metadata(metadata: Dict[str, Any]) -> None:
     ensure_data_dir()
 
     METADATA_FILE.write_text(
@@ -169,556 +115,71 @@ def save_metadata(metadata: Dict[str, dict]) -> None:
         encoding="utf-8",
     )
 
-    load_metadata.clear()
-
-
-def build_file_hash(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def build_remote_signature(remote: dict) -> str:
-    """
-    Assinatura leve do arquivo remoto.
-
-    Usa md5Checksum quando disponível.
-    Como fallback, usa modifiedTime + size.
-    """
-    md5 = remote.get("md5Checksum")
-
-    if md5:
-        return f"md5:{md5}"
-
-    modified = remote.get("modifiedTime", "")
-    size = remote.get("size", "")
-
-    return f"modified:{modified}|size:{size}"
-
-
-def is_remote_file_changed(
-    file_name: str,
-    remote: dict,
-    metadata: Dict[str, dict],
-) -> bool:
-    """
-    Verifica se o arquivo remoto mudou em relação ao cache local.
-    """
-    previous = metadata.get(file_name, {})
-    previous_signature = previous.get("remote_signature")
-    current_signature = build_remote_signature(remote)
-
-    local_path = DATA_DIR / file_name
-
-    if not local_path.exists():
-        return True
-
-    return previous_signature != current_signature
+    try:
+        load_metadata.clear()
+    except Exception:
+        pass
 
 
 def clear_dataset_caches() -> None:
     """
-    Limpa caches que dependem dos arquivos locais.
+    Limpa caches que dependem dos dados locais.
+    """
+    for func in [
+        read_local_parquet,
+        read_dataframe,
+        get_datasets_catalog,
+    ]:
+        try:
+            func.clear()
+        except Exception:
+            pass
+
+
+def build_dataframe_signature(df: pd.DataFrame) -> str:
+    """
+    Gera assinatura do DataFrame para saber se o Parquet precisa ser regravado.
+    """
+    if df is None or df.empty:
+        return "empty"
+
+    stable = df.copy()
+
+    if "Registro ID" in stable.columns:
+        stable = stable.sort_values("Registro ID")
+
+    stable = stable.reset_index(drop=True)
+
+    for col in stable.columns:
+        stable[col] = stable[col].astype(str).fillna("")
+
+    raw = stable.to_json(
+        orient="records",
+        force_ascii=False,
+        date_format="iso",
+    )
+
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_now_sao_paulo_str() -> str:
+    """
+    Retorna horário atual formatado no fuso de São Paulo.
     """
     try:
-        list_local_data_files.clear()
+        now = pd.Timestamp.now(tz="UTC").tz_convert("America/Sao_Paulo")
     except Exception:
-        pass
+        now = pd.Timestamp.utcnow()
 
-    try:
-        read_dataframe.clear()
-    except Exception:
-        pass
-
-    try:
-        read_consolidated_health_food_dataframe.clear()
-    except Exception:
-        pass
-
-    try:
-        get_datasets_catalog.clear()
-    except Exception:
-        pass
+    return now.strftime("%d/%m/%Y %H:%M")
 
 
 # =========================================================
-# GOOGLE DRIVE - RETRY / OAUTH
+# NORMALIZAÇÃO DOS DADOS
 # =========================================================
 
-def execute_drive_request(request, context: str = "requisição Google Drive", retries: int = 4):
-    """
-    Executa uma requisição da API do Google Drive com retry.
-
-    Protege o app contra falhas intermitentes no deploy:
-    - ssl.SSLError
-    - socket timeout
-    - connection reset
-    - HTTP 429 / 5xx
-    """
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            return request.execute(num_retries=2)
-
-        except HttpError as e:
-            status = getattr(e.resp, "status", None)
-            last_error = e
-
-            if status in [429, 500, 502, 503, 504]:
-                time.sleep(min(2 * attempt, 10))
-                continue
-
-            raise
-
-        except (
-            ssl.SSLError,
-            socket.timeout,
-            TimeoutError,
-            ConnectionError,
-            OSError,
-        ) as e:
-            last_error = e
-            time.sleep(min(2 * attempt, 10))
-            continue
-
-    raise RuntimeError(
-        f"Falha ao executar {context} após {retries} tentativas: {last_error}"
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def get_google_drive_service():
-    """
-    Cria o serviço do Google Drive.
-
-    Prioridade:
-    1. Usa GOOGLE_OAUTH_TOKEN_JSON do Streamlit Secrets.
-    2. Usa token.json local, se existir.
-    3. Se não houver token válido, usa credentials.json local ou
-       GOOGLE_OAUTH_CREDENTIALS_JSON para abrir OAuth local.
-
-    No deploy, o ideal é já existir GOOGLE_OAUTH_TOKEN_JSON.
-    """
-    if not GOOGLE_DRIVE_ENABLED:
-        return None
-
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-
-    creds = None
-
-    token_from_secrets = get_secret_json("GOOGLE_OAUTH_TOKEN_JSON")
-    credentials_from_secrets = get_secret_json("GOOGLE_OAUTH_CREDENTIALS_JSON")
-
-    if token_from_secrets:
-        creds = Credentials.from_authorized_user_info(
-            token_from_secrets,
-            GOOGLE_DRIVE_SCOPES,
-        )
-
-    elif os.path.exists(GOOGLE_OAUTH_TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(
-            GOOGLE_OAUTH_TOKEN_FILE,
-            GOOGLE_DRIVE_SCOPES,
-        )
-
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-
-    if not creds or not creds.valid:
-        if credentials_from_secrets:
-            flow = InstalledAppFlow.from_client_config(
-                credentials_from_secrets,
-                GOOGLE_DRIVE_SCOPES,
-            )
-        else:
-            if not os.path.exists(GOOGLE_OAUTH_CREDENTIALS_FILE):
-                raise FileNotFoundError(
-                    f"Arquivo de credenciais OAuth não encontrado: {GOOGLE_OAUTH_CREDENTIALS_FILE}. "
-                    "No local, coloque credentials.json na raiz. "
-                    "No deploy, configure GOOGLE_OAUTH_CREDENTIALS_JSON e "
-                    "GOOGLE_OAUTH_TOKEN_JSON nos secrets do Streamlit."
-                )
-
-            flow = InstalledAppFlow.from_client_secrets_file(
-                GOOGLE_OAUTH_CREDENTIALS_FILE,
-                GOOGLE_DRIVE_SCOPES,
-            )
-
-        creds = flow.run_local_server(
-            port=0,
-            prompt="consent",
-        )
-
-        with open(GOOGLE_OAUTH_TOKEN_FILE, "w", encoding="utf-8") as token_file:
-            token_file.write(creds.to_json())
-
-    return build(
-        "drive",
-        "v3",
-        credentials=creds,
-        cache_discovery=False,
-    )
-
-
-def escape_drive_query_value(value: str) -> str:
-    """
-    Escapa aspas simples para consultas na API do Drive.
-    """
-    return str(value).replace("'", "\\'")
-
-
-def buscar_pasta_por_nome(service, folder_name: str) -> str | None:
-    """
-    Busca uma pasta pelo nome no Google Drive.
-    """
-    folder_name_safe = escape_drive_query_value(folder_name)
-
-    query = (
-        "mimeType='application/vnd.google-apps.folder' "
-        f"and name='{folder_name_safe}' "
-        "and trashed=false"
-    )
-
-    request = service.files().list(
-        q=query,
-        fields="files(id, name)",
-        spaces="drive",
-        pageSize=10,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    )
-
-    response = execute_drive_request(
-        request,
-        context=f"buscar pasta '{folder_name}'",
-    )
-
-    files = response.get("files", [])
-
-    if not files:
-        return None
-
-    return files[0]["id"]
-
-
-def buscar_arquivo_na_pasta(service, folder_id: str, file_name: str) -> dict | None:
-    """
-    Busca um arquivo específico dentro de uma pasta.
-    """
-    file_name_safe = escape_drive_query_value(file_name)
-
-    query = (
-        f"'{folder_id}' in parents "
-        f"and name='{file_name_safe}' "
-        "and trashed=false"
-    )
-
-    request = service.files().list(
-        q=query,
-        fields="files(id, name, modifiedTime, mimeType, md5Checksum, size)",
-        spaces="drive",
-        pageSize=10,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    )
-
-    response = execute_drive_request(
-        request,
-        context=f"buscar arquivo '{file_name}'",
-    )
-
-    files = response.get("files", [])
-
-    if not files:
-        return None
-
-    return files[0]
-
-
-def list_drive_files_from_configured_folder() -> List[dict]:
-    """
-    Modo legado opcional:
-    lista arquivos de uma pasta única por GOOGLE_DRIVE_FOLDER_ID.
-    """
-    service = get_google_drive_service()
-
-    if service is None:
-        return []
-
-    if not GOOGLE_DRIVE_FOLDER_ID:
-        return []
-
-    query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false"
-
-    request = service.files().list(
-        q=query,
-        fields="files(id, name, modifiedTime, mimeType, md5Checksum, size)",
-        pageSize=1000,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    )
-
-    response = execute_drive_request(
-        request,
-        context="listar arquivos da pasta configurada",
-    )
-
-    return response.get("files", [])
-
-
-def list_drive_files_from_ubs_folders() -> List[dict]:
-    """
-    Lista os bancos XLSX das UBSs nas pastas esperadas.
-    Se uma pasta/arquivo falhar por instabilidade de rede, o app continua.
-    """
-    service = get_google_drive_service()
-
-    if service is None:
-        return []
-
-    files: List[dict] = []
-
-    for ubs_name, folder_name in DRIVE_UBS_FOLDERS.items():
-        expected_file_name = DRIVE_UBS_FILES[ubs_name]
-
-        try:
-            folder_id = buscar_pasta_por_nome(
-                service=service,
-                folder_name=folder_name,
-            )
-
-            if not folder_id:
-                continue
-
-            remote_file = buscar_arquivo_na_pasta(
-                service=service,
-                folder_id=folder_id,
-                file_name=expected_file_name,
-            )
-
-            if not remote_file:
-                continue
-
-            remote_file["ubs_name"] = ubs_name
-            remote_file["folder_name"] = folder_name
-            remote_file["folder_id"] = folder_id
-
-            files.append(remote_file)
-
-        except Exception as e:
-            st.warning(
-                f"Não foi possível consultar a UBS {ubs_name} no Google Drive agora. "
-                f"O painel continuará usando o cache local, se existir. Detalhe: {e}"
-            )
-            continue
-
-    return files
-
-
-def list_drive_files() -> List[dict]:
-    """
-    Lista arquivos do Drive.
-
-    Prioridade:
-    1. Se GOOGLE_DRIVE_FOLDER_ID estiver definido, lista essa pasta.
-    2. Caso contrário, busca automaticamente os bancos nas pastas das UBSs.
-    """
-    if GOOGLE_DRIVE_FOLDER_ID:
-        return list_drive_files_from_configured_folder()
-
-    return list_drive_files_from_ubs_folders()
-
-
-def download_drive_file(file_id: str) -> bytes:
-    """
-    Baixa arquivo do Google Drive com retry.
-    """
-    service = get_google_drive_service()
-
-    if service is None:
-        raise RuntimeError("Google Drive não está habilitado.")
-
-    from googleapiclient.http import MediaIoBaseDownload
-
-    last_error = None
-
-    for attempt in range(1, 5):
-        try:
-            request = service.files().get_media(
-                fileId=file_id,
-                supportsAllDrives=True,
-            )
-
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, request)
-
-            done = False
-
-            while not done:
-                _, done = downloader.next_chunk(num_retries=2)
-
-            return buffer.getvalue()
-
-        except (
-            ssl.SSLError,
-            socket.timeout,
-            TimeoutError,
-            ConnectionError,
-            OSError,
-            HttpError,
-        ) as e:
-            last_error = e
-            time.sleep(min(2 * attempt, 10))
-            continue
-
-    raise RuntimeError(f"Falha ao baixar arquivo do Google Drive: {last_error}")
-
-
-def sync_google_drive_data() -> Dict[str, int]:
-    """
-    Sincroniza dados do Google Drive para a pasta local data/.
-
-    Regra:
-    - consulta metadados primeiro;
-    - se assinatura remota não mudou, não baixa;
-    - se mudou, baixa e substitui cache local;
-    - atualiza _sync_metadata.json;
-    - se o Drive falhar por instabilidade, o app continua usando cache local.
-    """
-    ensure_data_dir()
-
-    if not GOOGLE_DRIVE_ENABLED:
-        return {"checked": 0, "downloaded": 0, "updated": 0, "skipped": 0}
-
-    try:
-        remote_files = list_drive_files()
-    except Exception as e:
-        st.warning(
-            f"Não foi possível consultar o Google Drive neste momento. "
-            f"O painel continuará usando os dados em cache local, se existirem. Detalhe: {e}"
-        )
-        return {"checked": 0, "downloaded": 0, "updated": 0, "skipped": 0}
-
-    metadata = load_metadata()
-
-    checked = downloaded = updated = skipped = 0
-    changed_any = False
-
-    for remote in remote_files:
-        checked += 1
-
-        file_name = remote["name"]
-        suffix = Path(file_name).suffix.lower()
-
-        if suffix not in SUPPORTED_EXTENSIONS:
-            skipped += 1
-            continue
-
-        local_path = DATA_DIR / file_name
-        is_update = file_name in metadata
-
-        if not is_remote_file_changed(file_name, remote, metadata):
-            skipped += 1
-            continue
-
-        try:
-            content = download_drive_file(remote["id"])
-            content_hash = build_file_hash(content)
-            local_path.write_bytes(content)
-
-            metadata[file_name] = {
-                "hash": content_hash,
-                "remote_signature": build_remote_signature(remote),
-                "file_id": remote["id"],
-                "folder_id": remote.get("folder_id"),
-                "folder_name": remote.get("folder_name"),
-                "ubs_name": remote.get("ubs_name"),
-                "modifiedTime": remote.get("modifiedTime"),
-                "mimeType": remote.get("mimeType"),
-                "md5Checksum": remote.get("md5Checksum"),
-                "size": remote.get("size"),
-            }
-
-            if is_update:
-                updated += 1
-            else:
-                downloaded += 1
-
-            changed_any = True
-
-        except Exception as e:
-            st.warning(
-                f"Não foi possível baixar/atualizar o arquivo {file_name}. "
-                f"O painel continuará usando o cache local, se existir. Detalhe: {e}"
-            )
-            skipped += 1
-            continue
-
-    if changed_any:
-        save_metadata(metadata)
-        clear_dataset_caches()
-
-    return {
-        "checked": checked,
-        "downloaded": downloaded,
-        "updated": updated,
-        "skipped": skipped,
-    }
-
-
-# =========================================================
-# LEITURA LOCAL / NORMALIZAÇÃO DE DATAFRAME
-# =========================================================
-
-@st.cache_data(show_spinner=False)
-def list_local_data_files() -> List[Path]:
-    """
-    Lista apenas arquivos reais de dados.
-
-    Importante:
-    - ignora _sync_metadata.json;
-    - ignora qualquer arquivo iniciado com "_";
-    - evita que arquivos internos de cache apareçam como dataset no painel.
-    """
-    ensure_data_dir()
-
-    files: List[Path] = []
-
-    for path in DATA_DIR.iterdir():
-        if not path.is_file():
-            continue
-
-        if path.name == METADATA_FILE.name:
-            continue
-
-        if path.name.startswith("_"):
-            continue
-
-        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            files.append(path)
-
-    return sorted(files, key=lambda p: p.name.lower())
-
-
-def is_health_food_bank_file(path: Path) -> bool:
-    """
-    Identifica bancos alimentados pelo sistema de submissão.
-    """
-    if not path.is_file():
-        return False
-
-    if path.name == METADATA_FILE.name:
-        return False
-
-    if path.name.startswith("_"):
-        return False
-
-    if path.suffix.lower() not in {".csv", ".xlsx", ".xls"}:
-        return False
-
-    return path.name.lower().startswith("banco_")
+def empty_health_food_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
 
 def normalize_column_name(value: Any) -> str:
@@ -727,7 +188,7 @@ def normalize_column_name(value: Any) -> str:
     """
     import unicodedata
 
-    text = str(value).strip().lower()
+    text = str(value or "").strip().lower()
     text = unicodedata.normalize("NFKD", text)
     text = "".join(char for char in text if not unicodedata.combining(char))
 
@@ -756,43 +217,76 @@ def normalize_column_name(value: Any) -> str:
     return text.strip("_")
 
 
+def normalize_ubs_name(value: Any) -> str | None:
+    """
+    Padroniza nomes das UBSs para o painel e mapa.
+    """
+    if value is None or pd.isna(value):
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    normalized = normalize_column_name(text)
+
+    aliases = {
+        "gama": "Gama",
+        "santa_maria": "Santa Maria",
+        "santa_maría": "Santa Maria",
+        "jardins_mangueiral": "Jardins Mangueiral",
+        "jardins_mangueral": "Jardins Mangueiral",
+    }
+
+    return aliases.get(normalized, text)
+
+
 def normalize_health_food_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Converte colunas do banco alimentado para o schema esperado pelo dashboard.
-
-    Entrada típica:
-    - ubs
-    - categoria
-    - tipo
-    - competencia
-    - valor
-    - identificados
-    - nao_identificados
-
-    Saída esperada:
-    - UBS
-    - Categoria
-    - Tipo
-    - Competência
-    - Valor
-    - Identificados
-    - Não identificados
+    Converte colunas vindas do Supabase ou do Parquet para o schema esperado pelo dashboard.
     """
     if df is None or df.empty:
-        return pd.DataFrame()
+        return empty_health_food_dataframe()
 
     out = df.copy()
 
     rename_by_normalized = {
+        "id": "Registro ID",
+        "registro_id": "Registro ID",
+
+        "ubs_id": "UBS ID",
+
+        "submissao_id": "Submissão ID",
+        "submissão_id": "Submissão ID",
+
+        "user_id": "Usuário ID",
+        "usuario_id": "Usuário ID",
+        "usuário_id": "Usuário ID",
+
         "ubs": "UBS",
         "categoria": "Categoria",
         "tipo": "Tipo",
+
         "competencia": "Competência",
+        "competência": "Competência",
+
         "valor": "Valor",
+
         "identificados": "Identificados",
         "identificado": "Identificados",
+
         "nao_identificados": "Não identificados",
+        "não_identificados": "Não identificados",
         "nao_identificado": "Não identificados",
+        "não_identificado": "Não identificados",
+
+        "arquivo_origem": "Arquivo origem",
+
+        "hash_registro": "Hash registro",
+
+        "created_at": "Criado em",
+        "criado_em": "Criado em",
     }
 
     rename_map = {}
@@ -805,100 +299,213 @@ def normalize_health_food_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.rename(columns=rename_map)
 
+    for col in EXPECTED_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+
+    out["UBS"] = out["UBS"].apply(normalize_ubs_name)
+
+    for col in ["Valor", "Identificados", "Não identificados"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+
+    out["Criado em"] = pd.to_datetime(
+        out["Criado em"],
+        errors="coerce",
+        utc=True,
+    )
+
+    out = out[EXPECTED_COLUMNS].copy()
+
     return out
 
 
-def read_excel_safely(path: Path) -> pd.DataFrame:
+# =========================================================
+# SUPABASE → DATAFRAME → PARQUET
+# =========================================================
+
+def fetch_supabase_registros() -> pd.DataFrame:
     """
-    Lê XLSX/XLS tentando primeiro a aba 'dados'.
-    Se a aba não existir, usa a primeira aba disponível.
+    Busca todos os registros da tabela registros_saude_alimentar no Supabase.
+
+    A paginação e a conexão ficam em supabase_client.py.
+    Aqui apenas transformamos a resposta em DataFrame analítico.
     """
+    rows = fetch_registros_saude_alimentar()
+
+    if not rows:
+        return empty_health_food_dataframe()
+
+    raw_df = pd.DataFrame(rows)
+
+    return normalize_health_food_columns(raw_df)
+
+
+def write_parquet_cache(df: pd.DataFrame) -> None:
+    """
+    Salva a base analítica local em Parquet.
+    """
+    ensure_data_dir()
+
+    normalized = normalize_health_food_columns(df)
+
+    normalized.to_parquet(
+        PARQUET_FILE,
+        index=False,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def read_local_parquet() -> pd.DataFrame:
+    """
+    Lê a base analítica local em Parquet.
+    """
+    ensure_data_dir()
+
+    if not PARQUET_FILE.exists():
+        return empty_health_food_dataframe()
+
     try:
-        return pd.read_excel(path, sheet_name="dados")
-    except ValueError:
-        return pd.read_excel(path)
+        df = pd.read_parquet(PARQUET_FILE)
+        return normalize_health_food_columns(df)
+    except Exception:
+        return empty_health_food_dataframe()
+
+
+def sync_supabase_to_parquet(force: bool = False) -> Dict[str, Any]:
+    """
+    Sincroniza Supabase para uma base Parquet local.
+
+    Supabase é a fonte oficial.
+    Parquet é cache analítico local para performance do dashboard.
+    """
+    ensure_data_dir()
+
+    metadata = load_metadata()
+    cache_before = read_local_parquet()
+    cache_rows_before = int(len(cache_before))
+
+    try:
+        remote_df = fetch_supabase_registros()
+    except Exception as e:
+        st.warning(
+            "Não foi possível consultar o banco neste momento. "
+            "O painel continuará usando os dados já coletados, se existir. "
+            f"Detalhe: {e}"
+        )
+
+        return {
+            "success": False,
+            "source": "cache",
+            "message": str(e),
+            "supabase_rows": 0,
+            "cache_rows": cache_rows_before,
+            "rows": cache_rows_before,
+            "ubs_count": int(cache_before["UBS"].nunique()) if "UBS" in cache_before.columns else 0,
+            "updated": 0,
+            "skipped": 1,
+            "checked": 0,
+            "downloaded": 0,
+            "last_sync": metadata.get("last_sync"),
+        }
+
+    supabase_rows = int(len(remote_df))
+
+    ubs_count = (
+        int(remote_df["UBS"].dropna().nunique())
+        if "UBS" in remote_df.columns and not remote_df.empty
+        else 0
+    )
+
+    current_signature = build_dataframe_signature(remote_df)
+    previous_signature = metadata.get("data_signature")
+
+    should_write = (
+        force
+        or current_signature != previous_signature
+        or not PARQUET_FILE.exists()
+    )
+
+    if should_write:
+        write_parquet_cache(remote_df)
+
+        metadata = {
+            "source": "supabase",
+            "table": SUPABASE_REGISTROS_TABLE,
+            "parquet_file": str(PARQUET_FILE),
+            "data_signature": current_signature,
+            "supabase_rows": supabase_rows,
+            "ubs_count": ubs_count,
+            "last_sync": get_now_sao_paulo_str(),
+        }
+
+        save_metadata(metadata)
+        clear_dataset_caches()
+
+        return {
+            "success": True,
+            "source": "supabase",
+            "message": "Base já atualizada.",
+            "supabase_rows": supabase_rows,
+            "cache_rows": supabase_rows,
+            "rows": supabase_rows,
+            "ubs_count": ubs_count,
+            "updated": 1,
+            "skipped": 0,
+            "checked": supabase_rows,
+            "downloaded": 1,
+            "last_sync": metadata["last_sync"],
+        }
+
+    return {
+        "success": True,
+        "source": "cache",
+        "message": "Base já atualizada",
+        "supabase_rows": supabase_rows,
+        "cache_rows": cache_rows_before,
+        "rows": cache_rows_before,
+        "ubs_count": ubs_count,
+        "updated": 0,
+        "skipped": 1,
+        "checked": supabase_rows,
+        "downloaded": 0,
+        "last_sync": metadata.get("last_sync"),
+    }
+
+
+# Compatibilidade temporária com arquivos antigos.
+def sync_google_drive_data() -> Dict[str, Any]:
+    return sync_supabase_to_parquet(force=False)
+
+
+# =========================================================
+# LEITURA LOCAL / CATÁLOGO
+# =========================================================
+
+@st.cache_data(show_spinner=False)
+def list_local_data_files() -> List[Path]:
+    """
+    Lista apenas a base Parquet analítica do painel.
+    """
+    ensure_data_dir()
+
+    if PARQUET_FILE.exists():
+        return [PARQUET_FILE]
+
+    return []
 
 
 @st.cache_data(show_spinner=False)
 def read_dataframe(path_str: str) -> pd.DataFrame:
+    """
+    Lê um dataset local.
+    Neste novo fluxo, o dataset principal é o Parquet consolidado.
+    """
     path = Path(path_str)
-    suffix = path.suffix.lower()
 
-    if suffix == ".csv":
-        df = pd.read_csv(path)
+    if path == PARQUET_FILE or path.suffix.lower() == ".parquet":
+        return read_local_parquet()
 
-    elif suffix in {".xlsx", ".xls"}:
-        df = read_excel_safely(path)
-
-    elif suffix == ".parquet":
-        df = pd.read_parquet(path)
-
-    elif suffix in {".geojson", ".json"}:
-        try:
-            import geopandas as gpd
-
-            gdf = gpd.read_file(path)
-
-            if gdf.empty:
-                return pd.DataFrame()
-
-            if "geometry" in gdf.columns:
-                centroids = gdf.geometry.centroid
-                gdf["latitude"] = centroids.y
-                gdf["longitude"] = centroids.x
-
-            df = pd.DataFrame(
-                gdf.drop(columns=[c for c in ["geometry"] if c in gdf.columns])
-            )
-
-        except Exception:
-            df = pd.read_json(path)
-
-    else:
-        raise ValueError(f"Formato não suportado: {suffix}")
-
-    return normalize_health_food_columns(df)
-
-
-@st.cache_data(show_spinner=False)
-def read_consolidated_health_food_dataframe() -> pd.DataFrame:
-    """
-    Consolida todos os bancos locais das UBSs em um único DataFrame.
-
-    Lê todos os arquivos:
-    - banco_gama.xlsx
-    - banco_jardins_mangueral.xlsx
-    - banco_santa_maria.xlsx
-    - ou qualquer outro banco_*.xlsx/csv/xls
-    """
-    ensure_data_dir()
-
-    frames: list[pd.DataFrame] = []
-
-    for path in sorted(DATA_DIR.iterdir(), key=lambda p: p.name.lower()):
-        if not is_health_food_bank_file(path):
-            continue
-
-        try:
-            df = read_dataframe(str(path))
-
-            if df is None or df.empty:
-                continue
-
-            df = df.copy()
-            df["_arquivo_origem"] = path.name
-
-            frames.append(df)
-
-        except Exception:
-            continue
-
-    if not frames:
-        return pd.DataFrame()
-
-    consolidated = pd.concat(frames, ignore_index=True)
-
-    return consolidated
+    raise ValueError(f"Formato não suportado neste painel: {path.suffix}")
 
 
 @st.cache_data(show_spinner=False)
@@ -906,63 +513,29 @@ def get_datasets_catalog() -> List[dict]:
     """
     Monta o catálogo de datasets.
 
-    Primeiro item:
-    - base consolidada com todos os bancos das UBSs.
-
-    Demais itens:
-    - arquivos individuais locais.
+    O primeiro item é sempre a base consolidada do Supabase em Parquet.
     """
     catalog: List[dict] = []
 
-    consolidated_df = read_consolidated_health_food_dataframe()
+    df = read_local_parquet()
 
-    if not consolidated_df.empty:
-        lat_col, lon_col = detect_lat_lon_columns(consolidated_df)
+    if df.empty:
+        return catalog
 
-        catalog.append(
-            {
-                "name": CONSOLIDATED_DATASET_NAME,
-                "file_name": CONSOLIDATED_DATASET_FILE_NAME,
-                "path": CONSOLIDATED_DATASET_PATH,
-                "rows": int(len(consolidated_df)),
-                "cols": int(len(consolidated_df.columns)),
-                "is_geospatial": bool(lat_col and lon_col),
-                "lat_col": lat_col,
-                "lon_col": lon_col,
-            }
-        )
+    lat_col, lon_col = detect_lat_lon_columns(df)
 
-    for path in list_local_data_files():
-        try:
-            df = read_dataframe(str(path))
-            lat_col, lon_col = detect_lat_lon_columns(df)
-
-            catalog.append(
-                {
-                    "name": path.stem,
-                    "file_name": path.name,
-                    "path": str(path),
-                    "rows": int(len(df)),
-                    "cols": int(len(df.columns)),
-                    "is_geospatial": bool(lat_col and lon_col),
-                    "lat_col": lat_col,
-                    "lon_col": lon_col,
-                }
-            )
-
-        except Exception:
-            catalog.append(
-                {
-                    "name": path.stem,
-                    "file_name": path.name,
-                    "path": str(path),
-                    "rows": 0,
-                    "cols": 0,
-                    "is_geospatial": False,
-                    "lat_col": None,
-                    "lon_col": None,
-                }
-            )
+    catalog.append(
+        {
+            "name": CONSOLIDATED_DATASET_NAME,
+            "file_name": CONSOLIDATED_DATASET_FILE_NAME,
+            "path": CONSOLIDATED_DATASET_PATH,
+            "rows": int(len(df)),
+            "cols": int(len(df.columns)),
+            "is_geospatial": bool(lat_col and lon_col),
+            "lat_col": lat_col,
+            "lon_col": lon_col,
+        }
+    )
 
     return catalog
 
@@ -977,35 +550,51 @@ def detect_lat_lon_columns(df: pd.DataFrame) -> tuple[Optional[str], Optional[st
 def get_dataset_by_name(dataset_name: str) -> pd.DataFrame:
     """
     Retorna o dataframe pelo nome do dataset.
-
-    Se for a base consolidada, retorna a união de todos os bancos das UBSs.
     """
     if dataset_name == CONSOLIDATED_DATASET_NAME:
-        return read_consolidated_health_food_dataframe()
+        return read_local_parquet()
 
     catalog = get_datasets_catalog()
-
     item = next((d for d in catalog if d["name"] == dataset_name), None)
 
     if not item:
-        return pd.DataFrame()
-
-    if item.get("path") == CONSOLIDATED_DATASET_PATH:
-        return read_consolidated_health_food_dataframe()
+        return empty_health_food_dataframe()
 
     return read_dataframe(item["path"])
 
 
+def get_dataset_last_update(dataset_name: str) -> str | None:
+    """
+    Retorna a última atualização do cache local gerado a partir do Supabase.
+    """
+    metadata = load_metadata()
+
+    return metadata.get("last_sync")
+
+
+# =========================================================
+# TIPOS DE COLUNAS
+# =========================================================
+
 def get_numeric_columns(df: pd.DataFrame) -> List[str]:
+    if df is None or df.empty:
+        return []
+
     return df.select_dtypes(include="number").columns.tolist()
 
 
 def get_categorical_columns(df: pd.DataFrame) -> List[str]:
+    if df is None or df.empty:
+        return []
+
     return df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
 
 def get_datetime_columns(df: pd.DataFrame) -> List[str]:
-    candidates = []
+    if df is None or df.empty:
+        return []
+
+    candidates: list[str] = []
 
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
@@ -1014,7 +603,7 @@ def get_datetime_columns(df: pd.DataFrame) -> List[str]:
 
         if df[col].dtype == object:
             try:
-                converted = pd.to_datetime(df[col], errors="raise")
+                converted = pd.to_datetime(df[col], errors="coerce")
 
                 if converted.notna().sum() > 0:
                     candidates.append(col)
@@ -1025,52 +614,25 @@ def get_datetime_columns(df: pd.DataFrame) -> List[str]:
     return candidates
 
 
-def get_dataset_last_update(dataset_name: str) -> str | None:
-    """
-    Retorna a data/hora de atualização do arquivo no Google Drive
-    com base no metadata local de sincronização.
+# =========================================================
+# DIAGNÓSTICO
+# =========================================================
 
-    Para a base consolidada, retorna a atualização mais recente entre os bancos.
+def get_environment_status() -> Dict[str, Any]:
+    """
+    Status básico do ambiente sem expor chaves sensíveis.
     """
     metadata = load_metadata()
+    df = read_local_parquet()
+    supabase_status = get_supabase_environment_status()
+    connection_test = test_supabase_connection()
 
-    if dataset_name == CONSOLIDATED_DATASET_NAME:
-        modified_times = []
-
-        for file_name, item in metadata.items():
-            if not str(file_name).lower().startswith("banco_"):
-                continue
-
-            modified_time = item.get("modifiedTime")
-
-            if modified_time:
-                modified_times.append(modified_time)
-
-        if not modified_times:
-            return None
-
-        try:
-            latest = max(pd.to_datetime(modified_times, utc=True))
-            dt = latest.tz_convert("America/Sao_Paulo")
-            return dt.strftime("%d/%m/%Y %H:%M")
-        except Exception:
-            return str(max(modified_times))
-
-    catalog = get_datasets_catalog()
-
-    item = next((d for d in catalog if d["name"] == dataset_name), None)
-
-    if not item:
-        return None
-
-    file_name = item["file_name"]
-    modified_time = metadata.get(file_name, {}).get("modifiedTime")
-
-    if not modified_time:
-        return None
-
-    try:
-        dt = pd.to_datetime(modified_time, utc=True).tz_convert("America/Sao_Paulo")
-        return dt.strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        return str(modified_time)
+    return {
+        **supabase_status,
+        "supabase_conexao_ok": bool(connection_test.get("success")),
+        "supabase_conexao_msg": connection_test.get("message"),
+        "parquet_existe": PARQUET_FILE.exists(),
+        "parquet_path": str(PARQUET_FILE),
+        "linhas_cache": int(len(df)),
+        "ultima_sincronizacao": metadata.get("last_sync"),
+    }
