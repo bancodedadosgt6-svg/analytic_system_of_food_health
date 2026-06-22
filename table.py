@@ -126,12 +126,10 @@ def _render_dataset_update_caption(dataset_name: str) -> None:
 
     if last_update:
         st.caption(
-            f"Fonte oficial: Supabase • Cache analítico local: Parquet • "
             f"Última sincronização: {last_update}"
         )
     else:
         st.caption(
-            "Fonte oficial: Supabase • Cache analítico local: Parquet • "
             "Última sincronização: não disponível"
         )
 
