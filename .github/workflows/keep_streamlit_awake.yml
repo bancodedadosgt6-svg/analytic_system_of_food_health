@@ -21,36 +21,33 @@ jobs:
     timeout-minutes: 3
 
     steps:
-      - name: Acessar healthcheck do Streamlit
+      - name: Acessar painel PET 6
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE_URL="https://painel-dados-pet6.streamlit.app"
-          HEALTH_URL="${BASE_URL}/_stcore/health"
+          URL="https://painel-dados-pet6.streamlit.app"
 
-          echo "Acessando: $HEALTH_URL"
+          echo "Acessando: $URL"
 
           STATUS_CODE=$(curl \
             --silent \
             --show-error \
-            --location \
-            --max-redirs 5 \
             --max-time 60 \
             --retry 3 \
             --retry-delay 10 \
             --retry-all-errors \
             --user-agent "Mozilla/5.0 GitHubActions KeepAlive" \
-            --output /tmp/streamlit_health_response.txt \
+            --output /tmp/streamlit_response.html \
             --write-out "%{http_code}" \
-            "$HEALTH_URL")
+            "$URL")
 
           echo "Status HTTP: $STATUS_CODE"
-          echo "Resposta:"
-          cat /tmp/streamlit_health_response.txt || true
 
           if [ "$STATUS_CODE" -lt 200 ] || [ "$STATUS_CODE" -ge 400 ]; then
-            echo "Falha ao acessar o healthcheck do Streamlit."
+            echo "Falha ao acessar o Streamlit."
+            echo "Trecho da resposta:"
+            head -n 20 /tmp/streamlit_response.html || true
             exit 1
           fi
 
