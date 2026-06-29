@@ -2,14 +2,43 @@ name: Keep Streamlit Awake
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    # A cada 1 hora, no minuto 23
+    - cron: "23 * * * *"
+
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-streamlit-awake
+  cancel-in-progress: true
 
 jobs:
   ping:
+    name: Ping Streamlit App
     runs-on: ubuntu-latest
+    timeout-minutes: 2
 
     steps:
-      - name: Acessar painel da PET 6
+      - name: Acessar painel PET 6
         run: |
-          curl -L --max-time 60 --retry 3 --retry-delay 10 "https://painel-dados-pet6.streamlit.app/" || true
+          URL="https://painel-dados-pet6.streamlit.app/"
+
+          echo "Acessando: $URL"
+
+          curl \
+            --location \
+            --fail \
+            --silent \
+            --show-error \
+            --compressed \
+            --max-time 60 \
+            --retry 3 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            --user-agent "Mozilla/5.0 GitHubActions KeepAlive" \
+            "$URL" \
+            --output /dev/null
+
+          echo "Ping realizado com sucesso."
