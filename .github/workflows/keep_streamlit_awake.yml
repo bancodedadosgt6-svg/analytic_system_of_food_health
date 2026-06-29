@@ -18,27 +18,40 @@ jobs:
   ping:
     name: Ping Streamlit App
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
 
     steps:
-      - name: Acessar painel PET 6
+      - name: Acessar healthcheck do Streamlit
+        shell: bash
         run: |
-          URL="https://painel-dados-pet6.streamlit.app/"
+          set -euo pipefail
 
-          echo "Acessando: $URL"
+          BASE_URL="https://painel-dados-pet6.streamlit.app"
+          HEALTH_URL="${BASE_URL}/_stcore/health"
 
-          curl \
-            --location \
-            --fail \
+          echo "Acessando: $HEALTH_URL"
+
+          STATUS_CODE=$(curl \
             --silent \
             --show-error \
-            --compressed \
+            --location \
+            --max-redirs 5 \
             --max-time 60 \
             --retry 3 \
             --retry-delay 10 \
             --retry-all-errors \
             --user-agent "Mozilla/5.0 GitHubActions KeepAlive" \
-            "$URL" \
-            --output /dev/null
+            --output /tmp/streamlit_health_response.txt \
+            --write-out "%{http_code}" \
+            "$HEALTH_URL")
+
+          echo "Status HTTP: $STATUS_CODE"
+          echo "Resposta:"
+          cat /tmp/streamlit_health_response.txt || true
+
+          if [ "$STATUS_CODE" -lt 200 ] || [ "$STATUS_CODE" -ge 400 ]; then
+            echo "Falha ao acessar o healthcheck do Streamlit."
+            exit 1
+          fi
 
           echo "Ping realizado com sucesso."
